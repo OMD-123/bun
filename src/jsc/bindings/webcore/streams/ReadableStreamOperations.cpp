@@ -6,6 +6,7 @@
 
 #include "BunClientData.h"
 #include "BunStreamSource.h"
+#include "GeneratedReadableStream.h"
 #include "JSBuffer.h"
 #include "JSDOMWrapperCache.h"
 #include "JSDirectStreamController.h"
@@ -495,6 +496,8 @@ static JSPromise* readableStreamCancelDeferred(JSGlobalObject* globalObject, JSR
     RELEASE_AND_RETURN(scope, promiseFulfilledWith(globalObject, JSC::jsUndefined()));
 }
 
+extern "C" void Bun__FileReader__setFlowing(void* source, bool flowing);
+
 // ReadableStreamReaderGenericInitialize(reader, stream)
 void readableStreamReaderGenericInitialize(JSGlobalObject* globalObject, JSReadableStreamReaderBase* reader, JSReadableStream* stream)
 {
@@ -515,6 +518,12 @@ void readableStreamReaderGenericInitialize(JSGlobalObject* globalObject, JSReada
     reader->m_closedPromise.set(vm, reader, closedPromise);
     reader->m_stream.set(vm, reader, stream);
     stream->m_reader.set(vm, stream, reader);
+    // Bun: a paused process.stdin stops the native source it shares with Bun.stdin.stream(); the next reader resumes it.
+    if (stream->m_state == ReadableStreamState::Readable && stream->m_controllerKind == ControllerKind::Default && defaultControllerOf(stream)->m_algorithms.kind == SourceKind::Native) {
+        auto* adapter = uncheckedDowncast<WebCore::JSNativeStreamSourceAdapter>(defaultControllerOf(stream)->m_algorithms.algorithmContext.get());
+        if (auto* source = dynamicDowncast<Bindgen::Generated::JSFileInternalReadableStreamSource>(adapter->handle()))
+            Bun__FileReader__setFlowing(source->wrapped(), true);
+    }
 }
 
 // Bun: drop the native handle's event-loop ref when its consumer releases the lock.

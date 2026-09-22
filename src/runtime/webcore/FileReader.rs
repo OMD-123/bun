@@ -915,6 +915,12 @@ impl FileReader {
 
 pub(crate) type Source = readable_stream::NewSource<FileReader>;
 
+/// A reader locked the stream over this source (`readableStreamReaderGenericInitialize`).
+#[unsafe(no_mangle)]
+pub(crate) extern "C" fn Bun__FileReader__setFlowing(source: &Source, flowing: bool) {
+    source.context.set_flowing(flowing);
+}
+
 // SAFETY: `FileReader` is always the `context` field of a heap-allocated
 // `Source`. `parent` is the `raw` arm for releasing a ref, which can free it.
 bun_core::impl_field_parent! { FileReader => Source.context; pub fn raw parent; pub fn shared parent_const; }
