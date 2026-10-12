@@ -1062,6 +1062,8 @@ impl<const SSL: bool, const DEBUG: bool> NewServer<SSL, DEBUG> {
             ctx_ref.render_missing();
             return;
         }
+        #[cfg(debug_assertions)]
+        ctx_ref.assert_no_parked_open_head();
 
         // The request is asynchronous, and all information from `req` must be copied
         // since the provided uws.Request will be re-used for future requests (stack allocated).
@@ -1124,6 +1126,8 @@ impl<const SSL: bool, const DEBUG: bool> NewServer<SSL, DEBUG> {
             ctx_ref.render_missing();
             return;
         }
+        #[cfg(debug_assertions)]
+        ctx_ref.assert_no_parked_open_head();
 
         // The request is asynchronous, and all information from `req` must be
         // copied since the provided uws.Request will be re-used for future
