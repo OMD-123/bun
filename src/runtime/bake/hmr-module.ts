@@ -106,7 +106,8 @@ export class HMRModule {
    *  should throw the same error */
   failure: unknown = null;
   /** Two purposes:
-   * 1. HMRModule[] - List of parsed imports. indexOf is used to go from HMRModule -> updater function
+   * 1. HMRModule[] - List of parsed imports, one for each import statement. The
+   *    position of an HMRModule is the position of its updater function
    * 2. any[] - List of module namespace objects. Read by the ESM module's load function.
    * Unused for CJS
    */
@@ -818,10 +819,12 @@ function patchImporters(mod: HMRModule) {
   const { importers } = mod;
   const exports = getEsmExports(mod);
   for (const importer of importers) {
-    if (!importer.esm || !importer.updateImport) continue;
-    const index = importer.imports!.indexOf(mod);
-    if (index === -1) continue; // require or dynamic import
-    importer.updateImport![index](exports);
+    const { imports, updateImport } = importer;
+    if (!importer.esm || !updateImport) continue;
+    // One position for each import statement of `mod`. None for a require or a dynamic import.
+    for (let index = imports!.indexOf(mod); index !== -1; index = imports!.indexOf(mod, index + 1)) {
+      updateImport[index](exports);
+    }
   }
 }
 

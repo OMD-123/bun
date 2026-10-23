@@ -1,7 +1,7 @@
 // Hot tests ensure that the `import.meta.hot` interface is functional
 import { expect } from "bun:test";
 import { renameSync, unlinkSync, writeFileSync } from "node:fs";
-import { devTest, emptyHtmlFile } from "../bake-harness";
+import { devTest, emptyHtmlFile, minimalFramework } from "../bake-harness";
 
 devTest("import.meta.hot.accept basic", {
   files: {
@@ -103,6 +103,51 @@ devTest("import.meta.hot.accept patches imports", {
     await c.expectMessage("C"); // C self accepted even if the new one doesnt
     expect(await c.js<string>`callFunction()`).toBe("B!2!5");
     expect(await c.js<string>`callFunction()`).toBe("B!3!6");
+  },
+});
+// The importer is not evaluated again. Each of its import statements has a binding
+// of its own, also the one that spells the path in another way.
+devTest("a hot update patches every import statement of the updated module", {
+  files: {
+    "index.html": emptyHtmlFile({
+      scripts: ["index.ts"],
+    }),
+    "index.ts": `
+      import { value as a } from "./dep";
+      import { value as b } from "./dep";
+      import { value as c } from "./dep.ts";
+      console.log("initial: " + a + " " + b + " " + c);
+      import.meta.hot.accept("./dep", () => {
+        console.log("accepted: " + a + " " + b + " " + c);
+      });
+    `,
+    "dep.ts": `export const value = 1;`,
+  },
+  async test(dev) {
+    await using c = await dev.client("/");
+    await c.expectMessage("initial: 1 1 1");
+    await dev.write("dep.ts", `export const value = 2;`);
+    await c.expectMessage("accepted: 2 2 2");
+  },
+});
+devTest("a hot update patches every import statement of the updated module (server)", {
+  framework: minimalFramework,
+  files: {
+    "dep.ts": `export const value = 1;`,
+    "routes/index.ts": `
+      import { value as a } from '../dep';
+      import { value as b } from '../dep';
+      import { value as c } from '../dep.ts';
+      globalThis.evaluated = (globalThis.evaluated ?? 0) + 1;
+      export default function (req, meta) {
+        return new Response(a + ' ' + b + ' ' + c + ', evaluated ' + globalThis.evaluated);
+      }
+    `,
+  },
+  async test(dev) {
+    await dev.fetch("/").equals("1 1 1, evaluated 1");
+    await dev.write("dep.ts", `export const value = 2;`);
+    await dev.fetch("/").equals("2 2 2, evaluated 1");
   },
 });
 devTest("import.meta.hot.accept specifier", {
