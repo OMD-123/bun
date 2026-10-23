@@ -603,6 +603,13 @@ Like `Bun.file()`, `S3File` extends [`Blob`](https://developer.mozilla.org/en-US
 
 Because `S3File` extends `Blob`, `S3File` instances work with `fetch()`, `Response`, and other web APIs that accept `Blob` instances.
 
+A `blob:` URL made from an `S3File` works with `fetch()`, which reads the object. `import()`, `require()` and `new Worker()` do not read the object: they throw a `TypeError` for that URL. Read the object first, and make the URL from a `File` with the same name, so that Bun picks the same loader:
+
+```ts s3.ts icon="/icons/typescript.svg"
+const file = new File([await s3file.bytes()], s3file.name);
+const module = await import(URL.createObjectURL(file));
+```
+
 ### Partial reads with `slice`
 
 To read a partial range of a file, use the `slice` method.

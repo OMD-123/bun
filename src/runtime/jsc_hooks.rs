@@ -1488,14 +1488,7 @@ mod vm_loader_ctx {
             // Returned slices borrow blob heap storage that lives until
             // `blob_deinit`; erased to `'static` per the interface signature —
             // sound because the bundler caller drops them before `blob_deinit`.
-            blob_store_path(b) => blob(b)
-                .store_path()
-                .map(|s| core::slice::from_raw_parts(s.as_ptr(), s.len())),
-            blob_needs_read_file(b) => blob(b).needs_to_read_file(),
-            blob_shared_view(b) => {
-                let v = blob(b).shared_view();
-                core::slice::from_raw_parts(v.as_ptr(), v.len())
-            },
+            blob_module_source(b) => blob_module_source(blob(b)),
             blob_deinit(b) => {
                 // SAFETY: `b` is the live boxed `Blob`; sole owner.
                 drop(bun_core::heap::take(b.cast::<Blob>()))
@@ -3956,7 +3949,57 @@ struct LoaderResult<'a> {
     package_json: Option<&'a bun_resolver::package_json::PackageJSON>,
 }
 
+/// What `blob` gives the module loader. The match names every kind of store,
+/// so a new kind does not compile until it has an arm here.
+fn blob_module_source(blob: &crate::webcore::Blob) -> options::BlobModuleSource<'_> {
+    use bun_jsc::node_path::PathOrFileDescriptor;
+    use bun_jsc::webcore_types::store::Data;
+    use options::BlobModuleSource;
+
+    match blob.store().map(|store| &store.data) {
+        None | Some(Data::Bytes(_)) => BlobModuleSource::InMemory(blob.shared_view()),
+        Some(Data::File(file)) => match &file.pathlike {
+            PathOrFileDescriptor::Path(path) => BlobModuleSource::FileOnDisk(path.slice()),
+            PathOrFileDescriptor::Fd(_) => BlobModuleSource::NotInMemory,
+        },
+        Some(Data::S3(_)) => BlobModuleSource::NotInMemory,
+    }
+}
+
+/// Whether `transpile_source_code_of_any_provenance` reads the text of the
+/// module for `loader`. Every other loader makes the module from its path alone.
+fn loader_reads_source(loader: Loader, is_main: bool) -> bool {
+    use Loader as L;
+    match loader {
+        L::Js
+        | L::Jsx
+        | L::Ts
+        | L::Tsx
+        | L::Json
+        | L::Jsonc
+        | L::Toml
+        | L::Yaml
+        | L::Json5
+        | L::Xml
+        | L::Text
+        | L::Md => true,
+        // The WASI runner gets the bytes of the entry module.
+        L::Wasm => is_main,
+        L::Css
+        | L::File
+        | L::Napi
+        | L::Base64
+        | L::Dataurl
+        | L::Bunsh
+        | L::Sqlite
+        | L::SqliteEmbedded
+        | L::Html => false,
+    }
+}
+
 /// `options.getLoaderAndVirtualSource` — high-tier body.
+///
+/// `force_loader` is the loader that the caller puts in place of the returned one.
 ///
 /// # Safety
 /// `jsc_vm` is the live per-thread VM; the returned borrows live as long as
@@ -3967,11 +4010,19 @@ unsafe fn get_loader_and_virtual_source<'a>(
     virtual_source_to_use: &'a mut Option<bun_ast::Source>,
     blob_to_deinit: &mut Option<crate::webcore::Blob>,
     type_attribute_str: Option<&[u8]>,
-) -> crate::Result<LoaderResult<'a>> {
+    force_loader: Option<Loader>,
+) -> Result<LoaderResult<'a>, options::GetLoaderAndVirtualSourceErr> {
     let (normalized_file_path_from_specifier, specifier, query) =
         // SAFETY: per fn contract.
         unsafe { normalize_specifier_for_loader(jsc_vm, specifier_str) };
     let mut path = Fs::Path::init(normalized_file_path_from_specifier);
+
+    // `?raw` and the `type` import attribute name the loader, whatever the path is.
+    let named_loader: Option<Loader> = type_attribute_str
+        .and_then(Loader::from_string)
+        .or((query == b"?raw").then_some(Loader::Text));
+    // SAFETY: per fn contract.
+    let is_main = unsafe { &*jsc_vm }.main() == Some(specifier);
 
     // SAFETY: per fn contract — `transpiler.options` is a value field of the VM.
     let mut loader: Option<Loader> =
@@ -4006,72 +4057,63 @@ unsafe fn get_loader_and_virtual_source<'a>(
             .resolve_and_dupe(&specifier[b"blob:".len()..], unsafe { &*jsc_vm }.global())
         {
             Some(blob) => {
-                *blob_to_deinit = Some(blob);
-                // SAFETY: `blob_to_deinit` is `Some` (just written); we hold
-                // `&mut` for the duration of this body, so `as_mut().unwrap()`
-                // is sound and the `&'a` reborrow points at storage owned by
-                // the *caller's* `Option<Blob>` slot (outlives `LoaderResult`).
-                let blob = blob_to_deinit.as_mut().unwrap();
+                // The caller's `blob_to_deinit` slot keeps the Blob, and with it
+                // the store that the path and the bytes below borrow, alive
+                // until the synchronous transpile that reads them has returned.
+                let blob = blob_to_deinit.insert(blob);
+                // "file:" loader makes no sense for blobs, so default to tsx.
                 // SAFETY: per fn contract — `jsc_vm` is the live per-thread VM.
                 loader = blob.get_loader(unsafe { &*jsc_vm });
 
-                // "file:" loader makes no sense for blobs, so default to tsx.
-                if let Some(filename) = blob.store_path() {
-                    // Only treat it as a file if it is a `Bun.file()`.
-                    if blob.needs_to_read_file() {
-                        // Note: borrowck — `Fs::Path<'a>` borrows
-                        // `filename`, which borrows `*blob_to_deinit`. The
-                        // caller owns that slot for `'a`, so erase via raw ptr.
-                        // SAFETY: `filename` borrows the blob's backing store,
-                        // which the caller's `blob_to_deinit` slot keeps alive
-                        // for `'a`; reconstructing the slice preserves provenance.
-                        path = Fs::Path::init(unsafe {
-                            core::slice::from_raw_parts(filename.as_ptr(), filename.len())
+                match blob_module_source(blob) {
+                    options::BlobModuleSource::InMemory(contents) => {
+                        // SAFETY: `bun_ast::Source` stores `&'static [u8]`, so
+                        // erase to `'static`. `contents` borrows the blob's
+                        // store (see above) and `path.text` borrows
+                        // `specifier_str`; both outlive the synchronous
+                        // `transpile_source_code_inner` call.
+                        let (contents, path_text): (&'static [u8], &'static [u8]) = unsafe {
+                            (
+                                bun_ptr::detach_lifetime(contents),
+                                bun_ptr::detach_lifetime(path.text),
+                            )
+                        };
+                        *virtual_source_to_use = Some(bun_ast::Source {
+                            // Note: `bun_ast::Source::path` is the
+                            // logger-local `fs::Path` (NOT `bun_resolver::fs::Path`
+                            // — see logger/lib.rs:32-). Re-init from `path.text`.
+                            path: bun_paths::fs::Path::init(path_text),
+                            contents: std::borrow::Cow::Borrowed(contents),
+                            ..Default::default()
                         });
+                        virtual_source = virtual_source_to_use.as_ref();
+                    }
+                    options::BlobModuleSource::FileOnDisk(file_path) => {
+                        // SAFETY: `file_path` borrows the blob's store, which
+                        // the caller's `blob_to_deinit` slot keeps alive for `'a`.
+                        path = Fs::Path::init(unsafe { bun_ptr::detach_lifetime(file_path) });
+                    }
+                    options::BlobModuleSource::NotInMemory => {
+                        // A loader that reads the text of the module has nothing
+                        // to read. Every other loader makes the module from the
+                        // URL, and gets no virtual source.
+                        let reads_source = force_loader
+                            .or(named_loader)
+                            .or(loader)
+                            .is_none_or(|loader| loader_reads_source(loader, is_main));
+                        if reads_source {
+                            return Err(options::GetLoaderAndVirtualSourceErr::BlobNotInMemory);
+                        }
                     }
                 }
-
-                if !blob.needs_to_read_file() {
-                    // SAFETY: same lifetime erasure as above — `shared_view()`
-                    // borrows the blob's backing store (held in the caller's
-                    // `blob_to_deinit` slot for the synchronous transpile).
-                    // `bun_ast::Source` stores `&'static [u8]` (see
-                    // logger/lib.rs §`type Str`), so erase to
-                    // `'static`; sound because the blob outlives the
-                    // synchronous `transpile_source_code_inner` call.
-                    let (contents, path_text): (&'static [u8], &'static [u8]) = unsafe {
-                        let v = blob.shared_view();
-                        (
-                            core::slice::from_raw_parts(v.as_ptr(), v.len()),
-                            core::slice::from_raw_parts(path.text.as_ptr(), path.text.len()),
-                        )
-                    };
-                    *virtual_source_to_use = Some(bun_ast::Source {
-                        // Note: `bun_ast::Source::path` is the
-                        // logger-local `fs::Path` (NOT `bun_resolver::fs::Path`
-                        // — see logger/lib.rs:32-). Re-init from `path.text`.
-                        path: bun_paths::fs::Path::init(path_text),
-                        contents: std::borrow::Cow::Borrowed(contents),
-                        ..Default::default()
-                    });
-                    virtual_source = virtual_source_to_use.as_ref();
-                }
             }
-            None => return Err(crate::Error::BlobNotFound),
+            None => return Err(options::GetLoaderAndVirtualSourceErr::BlobNotFound),
         }
     }
 
-    if query == b"?raw" {
-        loader = Some(Loader::Text);
+    if named_loader.is_some() {
+        loader = named_loader;
     }
-    if let Some(attr_str) = type_attribute_str {
-        if let Some(attr_loader) = Loader::from_string(attr_str) {
-            loader = Some(attr_loader);
-        }
-    }
-
-    // SAFETY: per fn contract.
-    let is_main = unsafe { &*jsc_vm }.main() == Some(specifier);
 
     // package.json sniff for `.js`/`.ts` module-type.
     let dir = path.name().dir;
@@ -4161,6 +4203,33 @@ fn intern_transpile_path(value: &[u8]) -> &'static [u8] {
     })
 }
 
+/// The error of a module load from a `blob:` URL that
+/// [`get_loader_and_virtual_source`] refused.
+#[cold]
+fn blob_url_error(
+    global: &JSGlobalObject,
+    specifier: &[u8],
+    err: options::GetLoaderAndVirtualSourceErr,
+) -> JSValue {
+    match err {
+        options::GetLoaderAndVirtualSourceErr::BlobNotFound => global
+            .err(
+                bun_jsc::ErrCode::ERR_MODULE_NOT_FOUND,
+                format_args!("Blob not found"),
+            )
+            .to_js(),
+        options::GetLoaderAndVirtualSourceErr::BlobNotInMemory => global
+            .err(
+                bun_jsc::ErrCode::ERR_INVALID_ARG_TYPE,
+                format_args!(
+                    "Cannot load a module from \"{}\": the Blob is S3-backed or file-descriptor-backed, so its bytes are not in memory. Read it first: URL.createObjectURL(new File([await blob.bytes()], blob.name))",
+                    bstr::BStr::new(specifier),
+                ),
+            )
+            .to_js(),
+    }
+}
+
 /// Modules that must always transpile on-thread (see [`Bun__transpileFile`]).
 const ALWAYS_SYNC_MODULES: &[&[u8]] = &[b"reflect-metadata"];
 
@@ -4213,17 +4282,12 @@ pub(crate) unsafe extern "C" fn Bun__transpileFile(
             &mut virtual_source_to_use,
             &mut blob_to_deinit,
             type_attribute_str,
+            force_loader_type,
         )
     } {
         Ok(lr) => lr,
-        Err(_) => {
-            let js = global
-                .err(
-                    bun_jsc::ErrCode::ERR_MODULE_NOT_FOUND,
-                    format_args!("Blob not found"),
-                )
-                .to_js();
-            *ret = ErrorableResolvedSource::err(js);
+        Err(err) => {
+            *ret = ErrorableResolvedSource::err(blob_url_error(global, _specifier.slice(), err));
             return ptr::null_mut();
         }
     };

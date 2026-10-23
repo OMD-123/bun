@@ -1,4 +1,5 @@
-import { expect, test } from "bun:test";
+import { S3Client } from "bun";
+import { describe, expect, test } from "bun:test";
 import { bunEnv, bunExe, tempDir } from "harness";
 
 test("Worker from a Blob", async () => {
@@ -227,4 +228,77 @@ test("object URL created in one worker is usable and revocable across threads", 
   expect(stderr).toBe("");
   expect(stdout.trim()).toBe('{"count":100,"ok":true}\na exited 0');
   expect(exitCode).toBe(0);
+});
+
+describe("blob: URL of an S3File in a Worker", () => {
+  // A local server is the S3 endpoint. It records every request.
+  function s3Endpoint() {
+    const requests: string[] = [];
+    const server = Bun.serve({
+      port: 0,
+      fetch(request) {
+        requests.push(`${request.method} ${new URL(request.url).pathname}`);
+        return new Response(`postMessage("loaded");`);
+      },
+    });
+    const s3 = new S3Client({
+      endpoint: server.url.href,
+      accessKeyId: "test",
+      secretAccessKey: "test",
+      bucket: "bucket",
+    });
+    return { requests, s3, [Symbol.dispose]: () => void server.stop(true) };
+  }
+  const refusal = (url: string) =>
+    `Cannot load a module from "${url}": the Blob is S3-backed or file-descriptor-backed, so its bytes are not in memory. Read it first: URL.createObjectURL(new File([await blob.bytes()], blob.name))`;
+
+  test("as the entry point, it gives the Worker an error event and sends no request", async () => {
+    using endpoint = s3Endpoint();
+    const url = URL.createObjectURL(endpoint.s3.file("worker.mjs"));
+    const worker = new Worker(url);
+    const { promise, resolve } = Promise.withResolvers<Event>();
+    worker.onerror = worker.onmessage = resolve;
+    worker.addEventListener("close", resolve);
+    const event = await promise;
+    URL.revokeObjectURL(url);
+
+    // The message of the event is the printed error. Its first line has the name and the message.
+    expect({ type: event.type, message: (event as ErrorEvent).message?.split("\n")[0] }).toEqual({
+      type: "error",
+      message: `TypeError: ${refusal(url)}`,
+    });
+    expect(endpoint.requests).toEqual([]);
+  });
+
+  test("import() in a Worker refuses it and sends no request", async () => {
+    using endpoint = s3Endpoint();
+    const url = URL.createObjectURL(endpoint.s3.file("module.mjs"));
+    const worker = new Worker(
+      URL.createObjectURL(
+        new Blob(
+          [
+            `self.onmessage = async ({ data: url }) => {
+              postMessage(
+                await import(url).then(
+                  module => ({ loaded: { ...module } }),
+                  error => ({ name: error.name, code: error.code, message: error.message }),
+                ),
+              );
+            };`,
+          ],
+          { type: "application/javascript" },
+        ),
+      ),
+    );
+    const { promise, resolve, reject } = Promise.withResolvers<unknown>();
+    worker.onmessage = event => resolve(event.data);
+    worker.onerror = event => reject(new Error(event.message));
+    worker.postMessage(url);
+    const outcome = await promise;
+    worker.terminate();
+    URL.revokeObjectURL(url);
+
+    expect(outcome).toEqual({ name: "TypeError", code: "ERR_INVALID_ARG_TYPE", message: refusal(url) });
+    expect(endpoint.requests).toEqual([]);
+  });
 });

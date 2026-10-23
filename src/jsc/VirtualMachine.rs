@@ -5167,7 +5167,11 @@ impl VirtualMachine {
             None,
         ) {
             Ok(lr) => lr,
-            Err(_) => return Err(crate::CrateError::ModuleNotFound),
+            // Either way there is no source to print.
+            Err(
+                bun_bundler::options::GetLoaderAndVirtualSourceErr::BlobNotFound
+                | bun_bundler::options::GetLoaderAndVirtualSourceErr::BlobNotInMemory,
+            ) => return Err(crate::CrateError::ModuleNotFound),
         };
         let module_type = lr
             .package_json

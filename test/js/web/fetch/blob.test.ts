@@ -1,9 +1,13 @@
+import { S3Client } from "bun";
 import { estimateShallowMemoryUsageOf } from "bun:jsc";
-import { describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
 import { bunEnv, bunExe, gcTick, isASAN, tempDir } from "harness";
 import type { BlobPropertyBag } from "node:buffer";
 import type { BinaryLike } from "node:crypto";
+import { closeSync, openSync } from "node:fs";
+import Module, { createRequire } from "node:module";
 import path from "node:path";
+import vm from "node:vm";
 
 test("blob: imports have sourcemapped stacktraces", async () => {
   const blob = new Blob(
@@ -162,6 +166,175 @@ test("blob: can be imported", async () => {
   expect(async () => {
     await import(url);
   }).toThrow();
+});
+
+describe("blob: URL of a Blob that is not in memory, loaded as a module", () => {
+  // A local server is the S3 endpoint. It records every request.
+  const objects: Record<string, string> = {
+    "/bucket/module.mjs": "export default 42;\n",
+    "/bucket/data.json": `{ "answer": 42 }`,
+    "/bucket/note.txt": "forty-two",
+    "/bucket/config.toml": "answer = 42\n",
+  };
+  const requests: string[] = [];
+  const urls: string[] = [];
+  let server: Bun.Server<undefined>;
+  let endpoint: Bun.S3Options;
+  let s3: S3Client;
+  let fd: number;
+
+  beforeAll(() => {
+    server = Bun.serve({
+      port: 0,
+      fetch(request) {
+        const { pathname } = new URL(request.url);
+        requests.push(`${request.method} ${pathname}`);
+        return new Response(objects[pathname]);
+      },
+    });
+    endpoint = { endpoint: server.url.href, accessKeyId: "test", secretAccessKey: "test", bucket: "bucket" };
+    s3 = new S3Client(endpoint);
+    fd = openSync(path.join(import.meta.dir, "fixtures", "file.txt"), "r");
+  });
+  afterEach(() => {
+    for (const url of urls.splice(0)) URL.revokeObjectURL(url);
+    requests.length = 0;
+  });
+  afterAll(async () => {
+    closeSync(fd);
+    await server.stop(true);
+  });
+
+  function urlOf(blob: Blob) {
+    const url = URL.createObjectURL(blob);
+    urls.push(url);
+    return url;
+  }
+  // A module in memory that loads `url` with an import statement.
+  const importerOf = (url: string) =>
+    urlOf(new File([`export { default } from ${JSON.stringify(url)};`], "importer.mjs"));
+  // What a load gives: the module, or the error.
+  async function outcome(load: () => unknown) {
+    try {
+      return { loaded: await load() };
+    } catch (e: any) {
+      return { name: e.name, code: e.code, message: e.message };
+    }
+  }
+  const refused = (url: string) => ({
+    name: "TypeError",
+    code: "ERR_INVALID_ARG_TYPE",
+    message: `Cannot load a module from "${url}": the Blob is S3-backed or file-descriptor-backed, so its bytes are not in memory. Read it first: URL.createObjectURL(new File([await blob.bytes()], blob.name))`,
+  });
+
+  test.each<[string, (url: string) => unknown]>([
+    ["import()", url => import(url)],
+    ["import() with { type: 'text' }", url => import(url, { with: { type: "text" } })],
+    ["an import statement", url => import(importerOf(url))],
+    ["require()", url => require(url)],
+    ["import.meta.require()", url => import.meta.require(url)],
+    ["createRequire()", url => createRequire(import.meta.url)(url)],
+    ["require() of a module that imports it", url => require(importerOf(url))],
+    ["Module._extensions['.js']()", url => Module._extensions[".js"](new Module(url), url)],
+    [
+      "Bun.ModuleGraph#import()",
+      async url => {
+        using graph = new Bun.ModuleGraph();
+        return await graph.import(url);
+      },
+    ],
+    [
+      "node:vm with the default loader",
+      url =>
+        vm.runInThisContext(`import(${JSON.stringify(url)})`, {
+          importModuleDynamically: vm.constants.USE_MAIN_CONTEXT_DEFAULT_LOADER,
+        }),
+    ],
+  ])("%s refuses an S3File and sends no request", async (_, load) => {
+    const url = urlOf(s3.file("module.mjs"));
+    expect(await outcome(() => load(url))).toEqual(refused(url));
+    expect(requests).toEqual([]);
+  });
+
+  test.each<[string, () => Blob]>([
+    ["S3File#slice()", () => s3.file("module.mjs").slice(4)],
+    ["an S3File with a JSON key", () => s3.file("data.json")],
+    ["Bun.file('s3://...')", () => Bun.file("s3://bucket/module.mjs", endpoint)],
+    ["Bun.file(fd)", () => Bun.file(fd)],
+  ])("import() refuses %s", async (_, blob) => {
+    const url = urlOf(blob());
+    expect(await outcome(() => import(url))).toEqual(refused(url));
+    expect(requests).toEqual([]);
+  });
+
+  test("a loader that does not read the module loads an S3File like a File in memory", async () => {
+    // The key, then the `type` import attribute.
+    const shapes: [string, string?][] = [
+      ["style.css"],
+      ["module.wasm"],
+      ["page.html"],
+      ["script.sh"],
+      ["module.mjs", "file"],
+      ["module.mjs", "css"],
+      ["module.mjs", "wasm"],
+      ["module.mjs", "html"],
+      ["module.mjs", "sh"],
+      ["module.mjs", "base64"],
+      ["module.mjs", "dataurl"],
+    ];
+    const load = async (blob: Blob, type: string | undefined) => {
+      const url = urlOf(blob);
+      const result = await outcome(() => import(url, { with: type ? { type } : {} }));
+      return JSON.stringify(result).replaceAll(url, "<url>");
+    };
+    const inMemory: Record<string, string> = {};
+    const inS3: Record<string, string> = {};
+    for (const [key, type] of shapes) {
+      const shape = type ? `${key} with { type: "${type}" }` : key;
+      inMemory[shape] = await load(new File([objects["/bucket/module.mjs"]], key), type);
+      inS3[shape] = await load(s3.file(key), type);
+    }
+    expect(inS3).toEqual(inMemory);
+    expect(requests).toEqual([]);
+  });
+
+  test("the module loads after the Blob is read, as the error message says", async () => {
+    const load = async (key: string) => {
+      const blob = s3.file(key);
+      return { ...(await import(urlOf(new File([await blob.bytes()], blob.name!)))) };
+    };
+    expect({
+      mjs: await load("module.mjs"),
+      json: await load("data.json"),
+      txt: await load("note.txt"),
+      toml: await load("config.toml"),
+    }).toEqual({
+      mjs: { default: 42 },
+      json: { default: { answer: 42 }, answer: 42 },
+      txt: { default: "forty-two" },
+      toml: { default: { answer: 42 }, answer: 42 },
+    });
+    expect(requests).toEqual([
+      "GET /bucket/module.mjs",
+      "GET /bucket/data.json",
+      "GET /bucket/note.txt",
+      "GET /bucket/config.toml",
+    ]);
+  });
+
+  test("fetch() of the same URL reads the object", async () => {
+    const url = urlOf(s3.file("module.mjs"));
+    expect(await (await fetch(url)).text()).toBe(objects["/bucket/module.mjs"]);
+    expect(requests).toEqual(["GET /bucket/module.mjs"]);
+  });
+
+  test("an empty Blob and a Bun.file(path) still load", async () => {
+    using dir = tempDir("blob-url-module", { "module.mjs": "export default 42;\n" });
+    expect({
+      empty: { ...(await import(urlOf(new Blob([])))) },
+      file: { ...(await import(urlOf(Bun.file(path.join(String(dir), "module.mjs"))))) },
+    }).toEqual({ empty: {}, file: { default: 42 } });
+  });
 });
 
 test("blob: can reliable get type from fetch #10072", async () => {

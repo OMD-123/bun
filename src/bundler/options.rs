@@ -452,10 +452,23 @@ pub(crate) fn normalize_specifier<'a>(
     (slice, specifier, query)
 }
 
+/// What the Blob behind a `blob:` URL gives the module loader.
+pub enum BlobModuleSource<'a> {
+    /// The bytes of an in-memory Blob.
+    InMemory(&'a [u8]),
+    /// The path of a `Bun.file(path)`. The loader reads that file.
+    FileOnDisk(&'a [u8]),
+    /// An S3 object or a `Bun.file(fd)`: no path to read, and the bytes are not in memory.
+    NotInMemory,
+}
+
 #[derive(Debug, thiserror::Error, strum::IntoStaticStr)]
 pub enum GetLoaderAndVirtualSourceErr {
     #[error("BlobNotFound")]
     BlobNotFound,
+    /// The source of the module is [`BlobModuleSource::NotInMemory`].
+    #[error("BlobNotInMemory")]
+    BlobNotInMemory,
 }
 
 pub struct LoaderResult<'a> {
@@ -512,30 +525,26 @@ pub fn get_loader_and_virtual_source<'a>(
     if jsc_vm.is_blob_url(specifier) {
         if let Some(blob) = jsc_vm.resolve_blob(&specifier[b"blob:".len()..]) {
             *blob_to_deinit = Some(blob);
-            loader = jsc_vm.blob_loader(blob);
-
             // "file:" loader makes no sense for blobs
             // so let's default to tsx.
-            if let Some(filename) = jsc_vm.blob_store_path(blob) {
-                let current_path = Fs::Path::init(filename);
+            loader = jsc_vm.blob_loader(blob);
 
-                // Only treat it as a file if is a Bun.file()
-                if jsc_vm.blob_needs_read_file(blob) {
-                    path = current_path;
+            match jsc_vm.blob_module_source(blob) {
+                BlobModuleSource::InMemory(contents) => {
+                    // SAFETY: `path.text` aliases the normalized specifier, which
+                    // outlives the `virtual_source` returned to the caller.
+                    let static_text: &'static [u8] = bun_ast::StoreStr::new(path.text).slice();
+                    *virtual_source_to_use = Some(bun_ast::Source {
+                        path: bun_paths::fs::Path::init(static_text),
+                        contents: Cow::Borrowed(contents),
+                        ..Default::default()
+                    });
+                    virtual_source = virtual_source_to_use.as_ref();
                 }
-            }
-
-            if !jsc_vm.blob_needs_read_file(blob) {
-                // SAFETY: `path.text` aliases jsc_vm-owned storage (blob filename
-                // or normalized specifier), which outlives the `virtual_source`
-                // returned to the caller.
-                let static_text: &'static [u8] = bun_ast::StoreStr::new(path.text).slice();
-                *virtual_source_to_use = Some(bun_ast::Source {
-                    path: bun_paths::fs::Path::init(static_text),
-                    contents: Cow::Borrowed(jsc_vm.blob_shared_view(blob)),
-                    ..Default::default()
-                });
-                virtual_source = virtual_source_to_use.as_ref();
+                BlobModuleSource::FileOnDisk(file_path) => path = Fs::Path::init(file_path),
+                BlobModuleSource::NotInMemory => {
+                    return Err(GetLoaderAndVirtualSourceErr::BlobNotInMemory);
+                }
             }
         } else {
             return Err(GetLoaderAndVirtualSourceErr::BlobNotFound);
