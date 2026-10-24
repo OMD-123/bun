@@ -899,6 +899,11 @@ impl FileReader {
 
         self.flowing.set(flag);
 
+        // A lazy reader has no parent and no fd before `on_start`, so there is nothing to pause or read yet.
+        if !self.started.get() {
+            return;
+        }
+
         if flag {
             self.reader().unpause();
             if !self.reader().is_done() && !self.reader().has_pending_read() {

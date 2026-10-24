@@ -585,6 +585,34 @@ describe("Bun's own stdin readers after process.stdin pauses", () => {
     expect(await run(script, [["READY\n", "one"]])).toEqual({ stdout: 'READY\n"one"\n', stderr: "", exitCode: 0 });
   });
 
+  // The native path of Readable.fromWeb resumes the source before it starts it.
+  test.concurrent("Readable.fromWeb(Bun.stdin.stream()) after pause()", async () => {
+    const consumer = `
+      let text = "";
+      for await (const chunk of require("node:stream").Readable.fromWeb(Bun.stdin.stream())) text += chunk;
+      got.push(...text.split("\\n"));
+    `;
+    expect(await run(child(`process.stdin.pause();`, consumer), [["READY\n", "two\nthree"]])).toEqual({
+      stdout: 'READY\n["two","three"]\n',
+      stderr: "",
+      exitCode: 0,
+    });
+  });
+
+  test.concurrent("Readable.fromWeb(Bun.stdin.stream()) in the same tick as pause()", async () => {
+    const script = `
+      (async () => {
+        process.stdin.pause();
+        const readable = require("node:stream").Readable.fromWeb(Bun.stdin.stream());
+        console.log("READY");
+        let text = "";
+        for await (const chunk of readable) text += chunk;
+        console.log(JSON.stringify(text));
+      })();
+    `;
+    expect(await run(script, [["READY\n", "one"]])).toEqual({ stdout: 'READY\n"one"\n', stderr: "", exitCode: 0 });
+  });
+
   test.concurrent("process.stdin takes stdin back after the Bun reader releases it", async () => {
     const script = `
       const got = [];
